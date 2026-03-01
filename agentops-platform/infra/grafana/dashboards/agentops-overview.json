@@ -1,0 +1,30 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "API Request Rate",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "rate(agentops_api_requests_total[1m])",
+          "legendFormat": "req/s",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 40,
+  "tags": ["agentops"],
+  "templating": {"list": []},
+  "time": {"from": "now-15m", "to": "now"},
+  "title": "AgentOps Overview",
+  "uid": "agentops-overview",
+  "version": 1
+}

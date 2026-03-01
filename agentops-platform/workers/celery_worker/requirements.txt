@@ -1,0 +1,5 @@
+celery==5.5.3
+redis==6.4.0
+prometheus-client==0.23.1
+requests==2.32.4
+psycopg[binary]==3.2.9
