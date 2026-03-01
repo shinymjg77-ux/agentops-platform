@@ -143,6 +143,11 @@ scripts/add_work_log.sh "제목"
 - UI 스펙: `docs/phase3-ui-spec-ko.md`
 - 테스트 계획: `docs/phase3-test-plan-ko.md`
 
+## Phase 4 문서 세트
+
+- PRD: `docs/PRD_AgentOps_v3_ko.md`
+- 계획: `docs/Phase4_Plan_ko.md`
+
 ## Phase 1 문서 세트(상세)
 
 - 데이터 모델: `docs/phase1-data-model-ko.md`
