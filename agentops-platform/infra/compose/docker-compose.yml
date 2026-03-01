@@ -50,6 +50,27 @@ services:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql://agentops:agentops@postgres:5432/agentops
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-http://alert-sink:8080/events}
+      API_BASE_URL: http://api:8000
+      AGENT_NAME: agentops-worker-1
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      alert-sink:
+        condition: service_started
+
+  worker-2:
+    build:
+      context: ../../workers/celery_worker
+    container_name: agentops-worker-2
+    profiles: ["multiworker"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://agentops:agentops@postgres:5432/agentops
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-http://alert-sink:8080/events}
+      API_BASE_URL: http://api:8000
+      AGENT_NAME: agentops-worker-2
     depends_on:
       redis:
         condition: service_healthy

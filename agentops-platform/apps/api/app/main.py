@@ -1,7 +1,8 @@
 import os
+import threading
 import time
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Iterator
 from uuid import NAMESPACE_DNS, UUID, uuid4, uuid5
 
@@ -28,6 +29,7 @@ app = FastAPI(title="AgentOps API", version="0.3.0")
 REQUEST_COUNTER = Counter("agentops_api_requests_total", "Total API requests")
 TASK_CREATED_COUNTER = Counter("agentops_tasks_created_total", "Total tasks created")
 celery_app = Celery("agentops_api", broker=REDIS_URL, backend=REDIS_URL)
+_SCHEDULER_THREAD_STARTED = False
 
 
 class TaskCreateRequest(BaseModel):
@@ -73,6 +75,44 @@ class TemplateVersionCreateRequest(BaseModel):
     retry_policy: dict[str, Any] | None = None
     timeout_sec: int | None = Field(default=None, ge=1, le=3600)
     set_default: bool = False
+
+
+class ScheduleCreateRequest(BaseModel):
+    name: str
+    template_name: str
+    template_version: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    # Phase3 MVP: "every:<seconds>" format only (e.g. every:60)
+    rrule_text: str = "every:60"
+    timezone: str = "Asia/Seoul"
+    is_active: bool = True
+
+
+class ScheduleUpdateRequest(BaseModel):
+    payload: dict[str, Any] | None = None
+    rrule_text: str | None = None
+    timezone: str | None = None
+    is_active: bool | None = None
+
+
+class PolicyCreateRequest(BaseModel):
+    name: str
+    scope_type: str = "template"
+    scope_ref: str | None = None
+    metric_key: str = "failure_rate"
+    operator: str = "gte"
+    threshold_value: float
+    window_minutes: int = Field(default=15, ge=1, le=1440)
+    cooldown_minutes: int = Field(default=30, ge=1, le=1440)
+    action_type: str = "pause_schedule"
+    action_payload: dict[str, Any] | None = None
+
+
+class PolicyUpdateRequest(BaseModel):
+    threshold_value: float | None = None
+    window_minutes: int | None = Field(default=None, ge=1, le=1440)
+    cooldown_minutes: int | None = Field(default=None, ge=1, le=1440)
+    is_active: bool | None = None
 
 
 PAYLOAD_MODEL_BY_ADAPTER: dict[str, type[BaseModel]] = {
@@ -264,6 +304,86 @@ def initialize_schema() -> None:
             """
         )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_schedules (
+                id UUID PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                template_id UUID NOT NULL REFERENCES task_templates(id) ON DELETE CASCADE,
+                template_name TEXT NOT NULL,
+                template_version TEXT,
+                payload_json JSONB NOT NULL,
+                rrule_text TEXT NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'Asia/Seoul',
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                next_run_at TIMESTAMPTZ,
+                last_run_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schedule_runs (
+                id UUID PRIMARY KEY,
+                schedule_id UUID NOT NULL REFERENCES task_schedules(id) ON DELETE CASCADE,
+                task_id UUID REFERENCES tasks(id) ON DELETE SET NULL,
+                planned_at TIMESTAMPTZ NOT NULL,
+                started_at TIMESTAMPTZ NOT NULL,
+                finished_at TIMESTAMPTZ,
+                status TEXT NOT NULL,
+                error_message TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agents (
+                id UUID PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                hostname TEXT,
+                status TEXT NOT NULL,
+                last_heartbeat_at TIMESTAMPTZ NOT NULL,
+                capacity INT NOT NULL DEFAULT 1,
+                queue_names TEXT[] NOT NULL DEFAULT '{}'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS policy_rules (
+                id UUID PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                scope_type TEXT NOT NULL,
+                scope_ref TEXT,
+                metric_key TEXT NOT NULL,
+                operator TEXT NOT NULL,
+                threshold_value DOUBLE PRECISION NOT NULL,
+                window_minutes INT NOT NULL DEFAULT 15,
+                cooldown_minutes INT NOT NULL DEFAULT 30,
+                action_type TEXT NOT NULL,
+                action_payload_json JSONB,
+                last_triggered_at TIMESTAMPTZ,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS policy_actions (
+                id UUID PRIMARY KEY,
+                rule_id UUID NOT NULL REFERENCES policy_rules(id) ON DELETE CASCADE,
+                action_type TEXT NOT NULL,
+                action_payload_json JSONB,
+                executed_at TIMESTAMPTZ NOT NULL,
+                status TEXT NOT NULL,
+                message TEXT
+            )
+            """
+        )
+
         conn.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS template_id UUID")
         conn.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS template_version TEXT")
         conn.execute(
@@ -317,6 +437,19 @@ def initialize_schema() -> None:
         )
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_template_default_unique ON task_template_versions(template_id) WHERE is_default"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_schedules_active_next ON task_schedules(is_active, next_run_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_schedule_runs_schedule_started ON schedule_runs(schedule_id, started_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agents_last_heartbeat ON agents(last_heartbeat_at DESC)"
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_policy_rules_active ON policy_rules(is_active)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_policy_actions_rule_executed ON policy_actions(rule_id, executed_at DESC)"
         )
 
         _seed_registry(conn)
@@ -511,9 +644,324 @@ def _parse_iso_dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(normalized)
 
 
+def _parse_every_seconds(rrule_text: str) -> int:
+    if not rrule_text.startswith("every:"):
+        raise HTTPException(status_code=422, detail="rrule_text must be 'every:<seconds>'")
+    raw = rrule_text.split(":", 1)[1]
+    try:
+        seconds = int(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid every seconds") from exc
+    if seconds < 10 or seconds > 86400:
+        raise HTTPException(status_code=422, detail="every seconds must be between 10 and 86400")
+    return seconds
+
+
+def _schedule_next_run(base: datetime, rrule_text: str) -> datetime:
+    seconds = _parse_every_seconds(rrule_text)
+    return base + timedelta(seconds=seconds)
+
+
+def _execute_schedule_run(conn: psycopg.Connection, schedule_row: tuple[Any, ...]) -> None:
+    # row: id, name, template_name, template_version, payload_json, rrule_text, next_run_at
+    schedule_id = schedule_row[0]
+    template_name = schedule_row[2]
+    template_version = schedule_row[3]
+    payload_json = schedule_row[4]
+    rrule_text = schedule_row[5]
+    planned_at = schedule_row[6]
+
+    resolved = resolve_template_version(conn, template_name, template_version)
+    normalized_payload = normalize_payload(template_name, resolved["adapter_name"], payload_json)
+    created_at = now_utc()
+    task_id = uuid4()
+    run_id = uuid4()
+    celery_task_id = dispatch_task(resolved["adapter_name"], normalized_payload)
+
+    conn.execute(
+        """
+        INSERT INTO tasks (id, template_name, template_id, template_version, payload_json, status, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            task_id,
+            template_name,
+            resolved["template_id"],
+            resolved["version"],
+            Jsonb(normalized_payload),
+            "queued",
+            created_at,
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO task_runs (
+            id, task_id, celery_task_id, status, started_at,
+            template_id, template_version, adapter_version
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            run_id,
+            task_id,
+            celery_task_id,
+            "queued",
+            created_at,
+            resolved["template_id"],
+            resolved["version"],
+            resolved["adapter_version"],
+        ),
+    )
+    append_task_log(
+        conn,
+        task_id=task_id,
+        run_id=run_id,
+        level="info",
+        message="scheduled task queued",
+        metadata={
+            "schedule_id": str(schedule_id),
+            "schedule_name": schedule_row[1],
+            "template_name": template_name,
+            "template_version": resolved["version"],
+            "celery_task_id": celery_task_id,
+        },
+    )
+    conn.execute(
+        """
+        INSERT INTO schedule_runs (id, schedule_id, task_id, planned_at, started_at, finished_at, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        (uuid4(), schedule_id, task_id, planned_at, created_at, now_utc(), "queued"),
+    )
+    conn.execute(
+        """
+        UPDATE task_schedules
+        SET last_run_at = %s,
+            next_run_at = %s,
+            updated_at = %s
+        WHERE id = %s
+        """,
+        (created_at, _schedule_next_run(created_at, rrule_text), now_utc(), schedule_id),
+    )
+
+
+def _evaluate_metric(metric_key: str, operator: str, actual: float, threshold: float) -> bool:
+    if metric_key not in {"failure_rate", "queue_lag_ms", "retry_rate"}:
+        return False
+    if operator == "gt":
+        return actual > threshold
+    if operator == "gte":
+        return actual >= threshold
+    if operator == "lt":
+        return actual < threshold
+    if operator == "lte":
+        return actual <= threshold
+    if operator == "eq":
+        return actual == threshold
+    return False
+
+
+def _policy_metric_value(conn: psycopg.Connection, rule_row: tuple[Any, ...]) -> tuple[float, str]:
+    # rule: id, scope_type, scope_ref, metric_key, operator, threshold, window, cooldown, action_type, action_payload, last_triggered
+    scope_type = rule_row[1]
+    scope_ref = rule_row[2]
+    metric_key = rule_row[3]
+    window_minutes = int(rule_row[6])
+    since = now_utc() - timedelta(minutes=window_minutes)
+
+    where = ["tr.started_at >= %s"]
+    params: list[Any] = [since]
+
+    if scope_type == "template" and scope_ref:
+        where.append("t.template_name = %s")
+        params.append(scope_ref)
+    elif scope_type == "schedule" and scope_ref:
+        where.append(
+            "EXISTS (SELECT 1 FROM task_logs tl WHERE tl.task_id = tr.task_id AND tl.metadata_json->>'schedule_name' = %s)"
+        )
+        params.append(scope_ref)
+
+    where_sql = " AND ".join(where)
+
+    if metric_key == "failure_rate":
+        row = conn.execute(
+            f"""
+            SELECT
+              COUNT(*)::float AS total,
+              SUM(CASE WHEN tr.status = 'failure' THEN 1 ELSE 0 END)::float AS failures
+            FROM task_runs tr
+            JOIN tasks t ON t.id = tr.task_id
+            WHERE {where_sql}
+            """,
+            tuple(params),
+        ).fetchone()
+        total = float(row[0] or 0)
+        failures = float(row[1] or 0)
+        value = (failures / total) * 100 if total > 0 else 0.0
+        return value, f"failure_rate={value:.2f}% (window={window_minutes}m)"
+
+    if metric_key == "retry_rate":
+        row = conn.execute(
+            f"""
+            SELECT
+              COUNT(*)::float AS total,
+              SUM(CASE WHEN tr.status = 'retry' THEN 1 ELSE 0 END)::float AS retries
+            FROM task_runs tr
+            JOIN tasks t ON t.id = tr.task_id
+            WHERE {where_sql}
+            """,
+            tuple(params),
+        ).fetchone()
+        total = float(row[0] or 0)
+        retries = float(row[1] or 0)
+        value = (retries / total) * 100 if total > 0 else 0.0
+        return value, f"retry_rate={value:.2f}% (window={window_minutes}m)"
+
+    # queue_lag_ms approximation with queued logs not started in recent window.
+    row = conn.execute(
+        f"""
+        SELECT COALESCE(MAX(EXTRACT(EPOCH FROM (%s - tr.started_at)) * 1000), 0)
+        FROM task_runs tr
+        JOIN tasks t ON t.id = tr.task_id
+        WHERE {where_sql} AND tr.status = 'queued'
+        """,
+        tuple([now_utc()] + params),
+    ).fetchone()
+    value = float(row[0] or 0)
+    return value, f"queue_lag_ms={value:.0f} (window={window_minutes}m)"
+
+
+def _execute_policy_action(conn: psycopg.Connection, rule_row: tuple[Any, ...], summary: str) -> None:
+    rule_id = rule_row[0]
+    scope_type = rule_row[1]
+    scope_ref = rule_row[2]
+    action_type = rule_row[8]
+    action_payload = rule_row[9]
+
+    status = "success"
+    message = summary
+
+    try:
+        if action_type == "pause_schedule":
+            if scope_type == "schedule" and scope_ref:
+                conn.execute(
+                    "UPDATE task_schedules SET is_active = FALSE, updated_at = %s WHERE name = %s",
+                    (now_utc(), scope_ref),
+                )
+            elif scope_type == "template" and scope_ref:
+                conn.execute(
+                    """
+                    UPDATE task_schedules
+                    SET is_active = FALSE, updated_at = %s
+                    WHERE template_name = %s
+                    """,
+                    (now_utc(), scope_ref),
+                )
+            message = f"{summary} -> schedules paused"
+        elif action_type == "limit_retry":
+            message = f"{summary} -> limit_retry noop (phase3 mvp)"
+        elif action_type == "raise_alert":
+            message = f"{summary} -> raise_alert noop (phase3 mvp)"
+        else:
+            status = "skipped"
+            message = f"unsupported action_type: {action_type}"
+    except Exception as exc:  # pragma: no cover
+        status = "failed"
+        message = f"action failed: {exc}"
+
+    conn.execute(
+        """
+        INSERT INTO policy_actions (id, rule_id, action_type, action_payload_json, executed_at, status, message)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            uuid4(),
+            rule_id,
+            action_type,
+            Jsonb(action_payload) if action_payload is not None else None,
+            now_utc(),
+            status,
+            message,
+        ),
+    )
+    conn.execute("UPDATE policy_rules SET last_triggered_at = %s WHERE id = %s", (now_utc(), rule_id))
+
+
+def scheduler_tick() -> None:
+    with db_conn() as conn:
+        due_rows = conn.execute(
+            """
+            SELECT id, name, template_name, template_version, payload_json, rrule_text, next_run_at
+            FROM task_schedules
+            WHERE is_active = TRUE
+              AND next_run_at IS NOT NULL
+              AND next_run_at <= %s
+            ORDER BY next_run_at ASC
+            LIMIT 20
+            """,
+            (now_utc(),),
+        ).fetchall()
+
+        for row in due_rows:
+            try:
+                _execute_schedule_run(conn, row)
+            except Exception as exc:  # pragma: no cover
+                conn.execute(
+                    """
+                    INSERT INTO schedule_runs (id, schedule_id, task_id, planned_at, started_at, finished_at, status, error_message)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (uuid4(), row[0], None, row[6], now_utc(), now_utc(), "failed", str(exc)),
+                )
+                conn.execute(
+                    "UPDATE task_schedules SET next_run_at = %s, updated_at = %s WHERE id = %s",
+                    (_schedule_next_run(now_utc(), row[5]), now_utc(), row[0]),
+                )
+
+        rules = conn.execute(
+            """
+            SELECT id, scope_type, scope_ref, metric_key, operator, threshold_value,
+                   window_minutes, cooldown_minutes, action_type, action_payload_json, last_triggered_at
+            FROM policy_rules
+            WHERE is_active = TRUE
+            ORDER BY created_at ASC
+            """
+        ).fetchall()
+
+        for rule in rules:
+            cooldown_until = rule[10] + timedelta(minutes=int(rule[7])) if rule[10] else None
+            if cooldown_until and cooldown_until > now_utc():
+                continue
+
+            actual, summary = _policy_metric_value(conn, rule)
+            if _evaluate_metric(rule[3], rule[4], actual, float(rule[5])):
+                _execute_policy_action(conn, rule, summary)
+
+        conn.commit()
+
+
+def _scheduler_loop() -> None:
+    while True:
+        try:
+            scheduler_tick()
+        except Exception:
+            pass
+        time.sleep(5)
+
+
+def start_scheduler_thread_once() -> None:
+    global _SCHEDULER_THREAD_STARTED
+    if _SCHEDULER_THREAD_STARTED:
+        return
+    thread = threading.Thread(target=_scheduler_loop, daemon=True, name="agentops-scheduler-loop")
+    thread.start()
+    _SCHEDULER_THREAD_STARTED = True
+
+
 @app.on_event("startup")
 def startup_event() -> None:
     initialize_schema()
+    start_scheduler_thread_once()
 
 
 @app.get("/healthz")
@@ -1291,6 +1739,470 @@ def analytics_template_versions(
         "versions": version_list if version_list else None,
         "items": items,
     }
+
+
+@app.get("/v1/schedules")
+def list_schedules(active_only: bool = False) -> list[dict[str, Any]]:
+    REQUEST_COUNTER.inc()
+    with db_conn() as conn:
+        where = "WHERE is_active = TRUE" if active_only else ""
+        rows = conn.execute(
+            f"""
+            SELECT id, name, template_name, template_version, payload_json, rrule_text, timezone,
+                   is_active, next_run_at, last_run_at, created_at, updated_at
+            FROM task_schedules
+            {where}
+            ORDER BY updated_at DESC, name
+            """
+        ).fetchall()
+    return [
+        {
+            "id": str(r[0]),
+            "name": r[1],
+            "template_name": r[2],
+            "template_version": r[3],
+            "payload": r[4],
+            "rrule_text": r[5],
+            "timezone": r[6],
+            "is_active": r[7],
+            "next_run_at": r[8].isoformat() if r[8] else None,
+            "last_run_at": r[9].isoformat() if r[9] else None,
+            "created_at": r[10].isoformat(),
+            "updated_at": r[11].isoformat(),
+        }
+        for r in rows
+    ]
+
+
+@app.post("/v1/schedules", status_code=201)
+def create_schedule(req: ScheduleCreateRequest) -> dict[str, Any]:
+    REQUEST_COUNTER.inc()
+    schedule_id = uuid4()
+    now = now_utc()
+    _parse_every_seconds(req.rrule_text)
+    with db_conn() as conn:
+        dup = conn.execute("SELECT 1 FROM task_schedules WHERE name = %s", (req.name,)).fetchone()
+        if dup:
+            raise HTTPException(status_code=409, detail=f"Schedule already exists: {req.name}")
+        resolved = resolve_template_version(conn, req.template_name, req.template_version)
+        normalized_payload = normalize_payload(req.template_name, resolved["adapter_name"], req.payload)
+        next_run = _schedule_next_run(now, req.rrule_text)
+        conn.execute(
+            """
+            INSERT INTO task_schedules (
+                id, name, template_id, template_name, template_version, payload_json, rrule_text,
+                timezone, is_active, next_run_at, last_run_at, created_at, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                schedule_id,
+                req.name,
+                resolved["template_id"],
+                req.template_name,
+                resolved["version"],
+                Jsonb(normalized_payload),
+                req.rrule_text,
+                req.timezone,
+                req.is_active,
+                next_run if req.is_active else None,
+                None,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+    return {"id": str(schedule_id), "name": req.name, "status": "created"}
+
+
+@app.get("/v1/schedules/{schedule_id}")
+def get_schedule(schedule_id: UUID) -> dict[str, Any]:
+    REQUEST_COUNTER.inc()
+    with db_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, name, template_name, template_version, payload_json, rrule_text, timezone,
+                   is_active, next_run_at, last_run_at, created_at, updated_at
+            FROM task_schedules
+            WHERE id = %s
+            """,
+            (schedule_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+    return {
+        "id": str(row[0]),
+        "name": row[1],
+        "template_name": row[2],
+        "template_version": row[3],
+        "payload": row[4],
+        "rrule_text": row[5],
+        "timezone": row[6],
+        "is_active": row[7],
+        "next_run_at": row[8].isoformat() if row[8] else None,
+        "last_run_at": row[9].isoformat() if row[9] else None,
+        "created_at": row[10].isoformat(),
+        "updated_at": row[11].isoformat(),
+    }
+
+
+@app.patch("/v1/schedules/{schedule_id}")
+def update_schedule(schedule_id: UUID, req: ScheduleUpdateRequest) -> dict[str, Any]:
+    REQUEST_COUNTER.inc()
+    with db_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT name, template_name, template_version, payload_json, rrule_text, timezone, is_active
+            FROM task_schedules
+            WHERE id = %s
+            """,
+            (schedule_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+
+        payload = req.payload if req.payload is not None else row[3]
+        rrule_text = req.rrule_text if req.rrule_text is not None else row[4]
+        timezone = req.timezone if req.timezone is not None else row[5]
+        is_active = req.is_active if req.is_active is not None else row[6]
+        _parse_every_seconds(rrule_text)
+
+        resolved = resolve_template_version(conn, row[1], row[2])
+        normalized_payload = normalize_payload(row[1], resolved["adapter_name"], payload)
+
+        next_run = _schedule_next_run(now_utc(), rrule_text) if is_active else None
+        conn.execute(
+            """
+            UPDATE task_schedules
+            SET payload_json = %s,
+                rrule_text = %s,
+                timezone = %s,
+                is_active = %s,
+                next_run_at = %s,
+                updated_at = %s
+            WHERE id = %s
+            """,
+            (Jsonb(normalized_payload), rrule_text, timezone, is_active, next_run, now_utc(), schedule_id),
+        )
+        conn.commit()
+    return get_schedule(schedule_id)
+
+
+@app.post("/v1/schedules/{schedule_id}/pause")
+def pause_schedule(schedule_id: UUID) -> dict[str, Any]:
+    REQUEST_COUNTER.inc()
+    with db_conn() as conn:
+        updated = conn.execute(
+            "UPDATE task_schedules SET is_active = FALSE, next_run_at = NULL, updated_at = %s WHERE id = %s RETURNING id",
+            (now_utc(), schedule_id),
+        ).fetchone()
+        if not updated:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        conn.commit()
+    return {"schedule_id": str(schedule_id), "status": "paused"}
+
+
+@app.post("/v1/schedules/{schedule_id}/resume")
+def resume_schedule(schedule_id: UUID) -> dict[str, Any]:
+    REQUEST_COUNTER.inc()
+    with db_conn() as conn:
+        row = conn.execute("SELECT rrule_text FROM task_schedules WHERE id = %s", (schedule_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        next_run = _schedule_next_run(now_utc(), row[0])
+        conn.execute(
+            "UPDATE task_schedules SET is_active = TRUE, next_run_at = %s, updated_at = %s WHERE id = %s",
+            (next_run, now_utc(), schedule_id),
+        )
+        conn.commit()
+    return {"schedule_id": str(schedule_id), "status": "active", "next_run_at": next_run.isoformat()}
+
+
+@app.post("/v1/schedules/{schedule_id}/run-now")
+def run_schedule_now(schedule_id: UUID) -> dict[str, Any]:
+    REQUEST_COUNTER.inc()
+    with db_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, name, template_name, template_version, payload_json, rrule_text, %s
+            FROM task_schedules
+            WHERE id = %s
+            """,
+            (now_utc(), schedule_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        _execute_schedule_run(conn, row)
+        conn.commit()
+    return {"schedule_id": str(schedule_id), "status": "queued"}
+
+
+@app.get("/v1/schedules/{schedule_id}/runs")
+def list_schedule_runs(schedule_id: UUID, limit: int = 50) -> list[dict[str, Any]]:
+    REQUEST_COUNTER.inc()
+    safe_limit = min(max(limit, 1), 200)
+    with db_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, schedule_id, task_id, planned_at, started_at, finished_at, status, error_message
+            FROM schedule_runs
+            WHERE schedule_id = %s
+            ORDER BY started_at DESC
+            LIMIT %s
+            """,
+            (schedule_id, safe_limit),
+        ).fetchall()
+    return [
+        {
+            "id": str(r[0]),
+            "schedule_id": str(r[1]),
+            "task_id": str(r[2]) if r[2] else None,
+            "planned_at": r[3].isoformat(),
+            "started_at": r[4].isoformat(),
+            "finished_at": r[5].isoformat() if r[5] else None,
+            "status": r[6],
+            "error_message": r[7],
+        }
+        for r in rows
+    ]
+
+
+@app.get("/v1/policies")
+def list_policies(active_only: bool = False) -> list[dict[str, Any]]:
+    REQUEST_COUNTER.inc()
+    with db_conn() as conn:
+        where = "WHERE is_active = TRUE" if active_only else ""
+        rows = conn.execute(
+            f"""
+            SELECT id, name, scope_type, scope_ref, metric_key, operator, threshold_value,
+                   window_minutes, cooldown_minutes, action_type, action_payload_json,
+                   last_triggered_at, is_active, created_at
+            FROM policy_rules
+            {where}
+            ORDER BY created_at DESC, name
+            """
+        ).fetchall()
+    return [
+        {
+            "id": str(r[0]),
+            "name": r[1],
+            "scope_type": r[2],
+            "scope_ref": r[3],
+            "metric_key": r[4],
+            "operator": r[5],
+            "threshold_value": r[6],
+            "window_minutes": r[7],
+            "cooldown_minutes": r[8],
+            "action_type": r[9],
+            "action_payload": r[10],
+            "last_triggered_at": r[11].isoformat() if r[11] else None,
+            "is_active": r[12],
+            "created_at": r[13].isoformat(),
+        }
+        for r in rows
+    ]
+
+
+@app.post("/v1/policies", status_code=201)
+def create_policy(req: PolicyCreateRequest) -> dict[str, Any]:
+    REQUEST_COUNTER.inc()
+    with db_conn() as conn:
+        dup = conn.execute("SELECT 1 FROM policy_rules WHERE name = %s", (req.name,)).fetchone()
+        if dup:
+            raise HTTPException(status_code=409, detail=f"Policy already exists: {req.name}")
+        policy_id = uuid4()
+        conn.execute(
+            """
+            INSERT INTO policy_rules (
+                id, name, scope_type, scope_ref, metric_key, operator, threshold_value,
+                window_minutes, cooldown_minutes, action_type, action_payload_json,
+                last_triggered_at, is_active, created_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s)
+            """,
+            (
+                policy_id,
+                req.name,
+                req.scope_type,
+                req.scope_ref,
+                req.metric_key,
+                req.operator,
+                req.threshold_value,
+                req.window_minutes,
+                req.cooldown_minutes,
+                req.action_type,
+                Jsonb(req.action_payload) if req.action_payload is not None else None,
+                None,
+                now_utc(),
+            ),
+        )
+        conn.commit()
+    return {"id": str(policy_id), "name": req.name, "status": "created"}
+
+
+@app.patch("/v1/policies/{policy_id}")
+def update_policy(policy_id: UUID, req: PolicyUpdateRequest) -> dict[str, Any]:
+    REQUEST_COUNTER.inc()
+    with db_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT threshold_value, window_minutes, cooldown_minutes, is_active
+            FROM policy_rules
+            WHERE id = %s
+            """,
+            (policy_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Policy not found")
+
+        threshold = req.threshold_value if req.threshold_value is not None else row[0]
+        window_minutes = req.window_minutes if req.window_minutes is not None else row[1]
+        cooldown_minutes = req.cooldown_minutes if req.cooldown_minutes is not None else row[2]
+        is_active = req.is_active if req.is_active is not None else row[3]
+
+        conn.execute(
+            """
+            UPDATE policy_rules
+            SET threshold_value = %s,
+                window_minutes = %s,
+                cooldown_minutes = %s,
+                is_active = %s
+            WHERE id = %s
+            """,
+            (threshold, window_minutes, cooldown_minutes, is_active, policy_id),
+        )
+        conn.commit()
+    return {"id": str(policy_id), "status": "updated"}
+
+
+@app.post("/v1/policies/{policy_id}/enable")
+def enable_policy(policy_id: UUID) -> dict[str, Any]:
+    REQUEST_COUNTER.inc()
+    with db_conn() as conn:
+        updated = conn.execute(
+            "UPDATE policy_rules SET is_active = TRUE WHERE id = %s RETURNING id",
+            (policy_id,),
+        ).fetchone()
+        if not updated:
+            raise HTTPException(status_code=404, detail="Policy not found")
+        conn.commit()
+    return {"id": str(policy_id), "status": "enabled"}
+
+
+@app.post("/v1/policies/{policy_id}/disable")
+def disable_policy(policy_id: UUID) -> dict[str, Any]:
+    REQUEST_COUNTER.inc()
+    with db_conn() as conn:
+        updated = conn.execute(
+            "UPDATE policy_rules SET is_active = FALSE WHERE id = %s RETURNING id",
+            (policy_id,),
+        ).fetchone()
+        if not updated:
+            raise HTTPException(status_code=404, detail="Policy not found")
+        conn.commit()
+    return {"id": str(policy_id), "status": "disabled"}
+
+
+@app.get("/v1/policies/{policy_id}/actions")
+def get_policy_actions(policy_id: UUID, limit: int = 50) -> list[dict[str, Any]]:
+    REQUEST_COUNTER.inc()
+    safe_limit = min(max(limit, 1), 200)
+    with db_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, action_type, action_payload_json, executed_at, status, message
+            FROM policy_actions
+            WHERE rule_id = %s
+            ORDER BY executed_at DESC
+            LIMIT %s
+            """,
+            (policy_id, safe_limit),
+        ).fetchall()
+    return [
+        {
+            "id": str(r[0]),
+            "action_type": r[1],
+            "action_payload": r[2],
+            "executed_at": r[3].isoformat(),
+            "status": r[4],
+            "message": r[5],
+        }
+        for r in rows
+    ]
+
+
+@app.post("/v1/agents/heartbeat")
+def agent_heartbeat(
+    name: str,
+    hostname: str | None = None,
+    capacity: int = 1,
+    queue_names: str | None = None,
+) -> dict[str, Any]:
+    REQUEST_COUNTER.inc()
+    if capacity < 1:
+        capacity = 1
+    queue_list = [q.strip() for q in (queue_names or "celery").split(",") if q.strip()]
+    agent_id = uuid5(NAMESPACE_DNS, f"agent:{name}")
+    with db_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO agents (id, name, hostname, status, last_heartbeat_at, capacity, queue_names)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (name) DO UPDATE
+            SET hostname = EXCLUDED.hostname,
+                status = EXCLUDED.status,
+                last_heartbeat_at = EXCLUDED.last_heartbeat_at,
+                capacity = EXCLUDED.capacity,
+                queue_names = EXCLUDED.queue_names
+            """,
+            (agent_id, name, hostname, "online", now_utc(), capacity, queue_list),
+        )
+        conn.commit()
+    return {"id": str(agent_id), "name": name, "status": "online"}
+
+
+@app.get("/v1/agents")
+def list_agents() -> list[dict[str, Any]]:
+    REQUEST_COUNTER.inc()
+    now = now_utc()
+    with db_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, name, hostname, status, last_heartbeat_at, capacity, queue_names
+            FROM agents
+            ORDER BY last_heartbeat_at DESC, name
+            """
+        ).fetchall()
+    result: list[dict[str, Any]] = []
+    for r in rows:
+        diff_sec = (now - r[4]).total_seconds()
+        derived = "online"
+        if diff_sec > 60:
+            derived = "degraded"
+        if diff_sec > 180:
+            derived = "offline"
+        result.append(
+            {
+                "id": str(r[0]),
+                "name": r[1],
+                "hostname": r[2],
+                "status": derived,
+                "last_heartbeat_at": r[4].isoformat(),
+                "capacity": r[5],
+                "queue_names": r[6],
+            }
+        )
+    return result
+
+
+@app.get("/v1/agents/{agent_id}")
+def get_agent(agent_id: UUID) -> dict[str, Any]:
+    REQUEST_COUNTER.inc()
+    agents = list_agents()
+    for agent in agents:
+        if agent["id"] == str(agent_id):
+            return agent
+    raise HTTPException(status_code=404, detail="Agent not found")
 
 
 @app.get("/metrics")

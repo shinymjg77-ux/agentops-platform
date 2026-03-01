@@ -1,4 +1,6 @@
 import os
+import socket
+import threading
 import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -14,6 +16,8 @@ from psycopg.types.json import Jsonb
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://agentops:agentops@postgres:5432/agentops")
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
+API_BASE_URL = os.getenv("API_BASE_URL", "http://api:8000").rstrip("/")
+AGENT_NAME = os.getenv("AGENT_NAME", socket.gethostname())
 
 celery_app = Celery("agentops_worker", broker=REDIS_URL, backend=REDIS_URL)
 
@@ -105,6 +109,31 @@ def send_alert(event_type: str, payload: dict[str, Any]) -> None:
     except Exception:
         # 알림 실패는 작업 실행 흐름을 막지 않는다.
         return
+
+
+def send_heartbeat() -> None:
+    try:
+        requests.post(
+            f"{API_BASE_URL}/v1/agents/heartbeat",
+            params={
+                "name": AGENT_NAME,
+                "hostname": socket.gethostname(),
+                "capacity": 1,
+                "queue_names": "celery",
+            },
+            timeout=3,
+        )
+    except Exception:
+        return
+
+
+def heartbeat_loop() -> None:
+    while True:
+        send_heartbeat()
+        time.sleep(15)
+
+
+threading.Thread(target=heartbeat_loop, daemon=True, name="worker-heartbeat-loop").start()
 
 
 @task_prerun.connect
