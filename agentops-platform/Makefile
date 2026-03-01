@@ -1,6 +1,6 @@
 COMPOSE_FILE=infra/compose/docker-compose.yml
 
-.PHONY: up down logs ps test-e2e test-e2e-phase2
+.PHONY: up down logs ps test-e2e test-e2e-phase2 test-e2e-phase3
 
 up:
 	docker compose -f $(COMPOSE_FILE) up -d --build
@@ -19,3 +19,6 @@ test-e2e:
 
 test-e2e-phase2:
 	./scripts/e2e_phase2.sh
+
+test-e2e-phase3:
+	./scripts/e2e_phase3.sh
