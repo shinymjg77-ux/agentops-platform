@@ -336,3 +336,67 @@
 
 ### 다음
 - Phase3 후보 기능(정책형 스케줄러, 멀티머신 확장) 우선순위 합의 후 착수
+
+## 2026-03-01 19:27 KST - Phase3 문서 세트 및 PRD 원칙 업데이트
+
+### 작업 내용
+- Phase3 문서 세트 작성:
+  - `docs/Phase3_Plan_ko.md`
+  - `docs/phase3-data-model-ko.md`
+  - `docs/phase3-api-spec-ko.md`
+  - `docs/phase3-ui-spec-ko.md`
+  - `docs/phase3-test-plan-ko.md`
+- PRD 업데이트:
+  - `docs/PRD_AgentOps_v2_ko.md`에 실행 원칙(기능 우선, 문서 우선) 섹션 추가
+- README 업데이트:
+  - Phase3 문서 세트 인덱스 추가
+
+### 검증
+- 문서 파일 생성/경로 확인 완료
+- PRD/README에 Phase3 문서 링크 반영 확인
+
+### 완료/오류
+- 완료:
+  - Phase3 구현 착수 전 문서 기준선 확정 완료
+- 오류:
+  - 없음
+
+### 다음
+- Phase3 구현 1순위: 스케줄러 DB/API 코어부터 착수
+
+## 2026-03-01 19:42 KST - Phase3 구현/검증 완료
+
+### 작업 내용
+- API/DB:
+  - 스케줄/정책/에이전트 테이블 및 인덱스 반영(`task_schedules`, `schedule_runs`, `policy_rules`, `policy_actions`, `agents`)
+  - 스케줄 CRUD + run-now + 실행이력 API 구현
+  - 정책 룰/액션 API 및 백그라운드 스케줄러 루프 구현
+  - 에이전트 heartbeat 수집/조회 API 구현
+  - 정책 `scope_type=schedule` 필터 SQL 버그 수정(`EXISTS ... task_logs` 기반)
+- Worker:
+  - heartbeat 전송 루프 추가(API `/v1/agents/heartbeat`)
+  - `tasks.py` 들여쓰기 오류 수정 후 재배포
+- Dashboard:
+  - `/schedules`, `/policies`, `/agents` 페이지 및 액션 route 추가
+- Infra:
+  - `worker-2` 서비스(`multiworker` profile) 추가
+- 테스트:
+  - `scripts/e2e_phase3.sh` 추가
+  - `Makefile`에 `test-e2e-phase3` 타겟 추가
+
+### 검증
+- `make test-e2e` 통과
+- `make test-e2e-phase2` 통과
+- `make test-e2e-phase3` 통과
+- `GET /v1/agents`에서 `agentops-worker-1`, `agentops-worker-2` heartbeat 확인
+- 멀티워커 분산 실행 확인(양쪽 worker 로그에서 task 수신 확인)
+
+### 완료/오류
+- 완료:
+  - Phase3 인수 체크리스트 항목 전부 완료 처리
+- 오류:
+  - 1) worker `IndentationError` 1건 발생 -> 즉시 수정
+  - 2) 정책 schedule scope SQL 버그 1건 발생 -> 조건식 수정 후 E2E 재통과
+
+### 다음
+- 원격 저장소 커밋/푸시 단위 정리

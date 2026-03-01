@@ -26,6 +26,9 @@
 - E2E 점검:
   - `make test-e2e`
   - `make test-e2e-phase2`
+  - `make test-e2e-phase3`
+- 멀티워커(선택) 기동:
+  - `docker compose -f infra/compose/docker-compose.yml --profile multiworker up -d --build worker-2`
 
 ## 4) 정상 상태 점검 절차
 1. 컨테이너 상태 확인
@@ -39,6 +42,8 @@
    - `curl -fsS http://localhost:18080/healthz`
 4. 기능 E2E 확인
    - `make test-e2e`
+   - `make test-e2e-phase2`
+   - `make test-e2e-phase3`
 
 ## 5) 장애 대응
 ### A. API/대시보드 응답 없음
@@ -80,3 +85,4 @@
   - API `healthz/readyz` 정상
   - Dashboard 접속 가능
   - `make test-e2e` 통과
+  - (Phase3 환경) `make test-e2e-phase2`, `make test-e2e-phase3` 통과

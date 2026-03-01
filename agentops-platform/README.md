@@ -37,6 +37,13 @@ E2E 테스트 실행:
 ```bash
 make test-e2e
 make test-e2e-phase2
+make test-e2e-phase3
+```
+
+멀티워커(선택) 실행:
+
+```bash
+docker compose -f infra/compose/docker-compose.yml --profile multiworker up -d --build worker-2
 ```
 
 ## 접속 주소
@@ -128,6 +135,14 @@ scripts/add_work_log.sh "제목"
 - UI 스펙: `docs/phase2-ui-spec-ko.md`
 - 테스트 계획: `docs/phase2-test-plan-ko.md`
 
+## Phase 3 문서 세트
+
+- 계획: `docs/Phase3_Plan_ko.md`
+- 데이터 모델: `docs/phase3-data-model-ko.md`
+- API 스펙: `docs/phase3-api-spec-ko.md`
+- UI 스펙: `docs/phase3-ui-spec-ko.md`
+- 테스트 계획: `docs/phase3-test-plan-ko.md`
+
 ## Phase 1 문서 세트(상세)
 
 - 데이터 모델: `docs/phase1-data-model-ko.md`
@@ -148,3 +163,4 @@ scripts/add_work_log.sh "제목"
 - 9단계: Phase1 E2E 스모크/실패 경로 테스트 스크립트 완료
 - 10단계: webhook 수신 검증(alert-sink)까지 포함한 Phase1 체크리스트 완료
 - 11단계: Phase2(템플릿 레지스트리/버전 비교/고급 검색) 구현 및 E2E 완료
+- 12단계: Phase3(스케줄/정책/에이전트/멀티워커) 구현 및 E2E 완료

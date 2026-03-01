@@ -206,3 +206,33 @@
   - 재빌드 후 Phase1/Phase2 E2E를 모두 재실행해 회귀 없음 확인.
 - 다음 액션:
   - 스키마 마이그레이션 쿼리는 배포 전 `psql` 단위 검증 스크립트를 추가해 사전 점검한다.
+
+## 2026-03-01 19:27 KST - Phase3 착수 전 PRD 정렬
+- 배경:
+  - Phase3는 기능 범위가 크고 운영 영향이 높아 구현 전에 우선순위 원칙을 PRD에 명시할 필요가 있었음.
+- 문제/미흡점:
+  - 기존 PRD에는 로드맵은 있으나, \"기능 우선/문서 우선\" 실행 규칙이 명문화되어 있지 않았음.
+- 원인:
+  - 이전 단계는 구현 중심으로 빠르게 진행되어 운영 원칙을 별도 섹션으로 관리하지 않았음.
+- 조치:
+  - PRD에 실행 원칙 섹션을 추가하고, Phase3 문서 세트를 먼저 확정.
+  - README 인덱스에 Phase3 문서 링크를 추가해 진입 경로 통일.
+- 다음 액션:
+  - 문서 기준으로 Phase3 스케줄러 코어 구현을 시작하고 변경사항을 로그에 즉시 반영한다.
+
+## 2026-03-01 19:42 KST - Phase3 구현 마무리 및 안정화
+- 배경:
+  - 스케줄/정책/에이전트 기능을 추가한 뒤 실제 런타임 안정성과 회귀 안전성을 빠르게 확보해야 했음.
+- 문제/미흡점:
+  - 신규 코드 반영 직후 worker 컨테이너가 기동 실패했고, 정책 액션이 schedule scope에서 동작하지 않았음.
+- 원인:
+  - `workers/celery_worker/tasks.py`에서 heartbeat 코드 병합 중 들여쓰기가 깨져 `IndentationError` 발생.
+  - API 정책 메트릭 쿼리에서 `scope_type=schedule` 조건이 존재하지 않는 JOIN alias를 참조함.
+- 조치:
+  - worker 들여쓰기 오류를 수정하고 워커 재빌드/재기동.
+  - schedule scope 조건을 `EXISTS (SELECT ... FROM task_logs ...)` 형태로 교체해 정책 필터를 정상화.
+  - `scripts/e2e_phase3.sh` 및 `make test-e2e-phase3` 추가.
+  - `infra/compose/docker-compose.yml`에 `worker-2`(multiworker profile) 추가 후 분산 수신 검증.
+  - README/runbook/Phase3 체크리스트/세션 로그를 완료 상태로 동기화.
+- 다음 액션:
+  - 커밋 단위를 `phase3-core`, `phase3-e2e-docs`로 분리해 원격 저장소에 푸시한다.
