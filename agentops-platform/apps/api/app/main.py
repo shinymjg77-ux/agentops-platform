@@ -3,6 +3,11 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+import base64
+import hashlib
+import hmac
+import json
+import secrets
 from typing import Any, Iterator
 from uuid import NAMESPACE_DNS, UUID, uuid4, uuid5
 
@@ -16,16 +21,24 @@ except Exception:  # pragma: no cover
 
 from celery import Celery
 from celery.result import AsyncResult
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field, ValidationError
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://agentops:agentops@postgres:5432/agentops")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+AUTH_MODE = os.getenv("AUTH_MODE", "optional").strip().lower()
+AUTH_JWT_SECRET = os.getenv("AUTH_JWT_SECRET", "dev-change-me")
+AUTH_TOKEN_TTL_SEC = int(os.getenv("AUTH_TOKEN_TTL_SEC", "28800"))
+AUTH_PASSWORD_ITERATIONS = int(os.getenv("AUTH_PASSWORD_ITERATIONS", "390000"))
+DEFAULT_ADMIN_EMAIL = os.getenv("DEFAULT_ADMIN_EMAIL", "admin@agentops.local")
+DEFAULT_ADMIN_PASSWORD = os.getenv("DEFAULT_ADMIN_PASSWORD", "change-me-now")
+DEFAULT_PROJECT_NAME = os.getenv("DEFAULT_PROJECT_NAME", "default")
+PUBLIC_V1_PATHS = {"/v1/auth/login", "/v1/auth/logout"}
 
-app = FastAPI(title="AgentOps API", version="0.3.0")
+app = FastAPI(title="AgentOps API", version="0.4.0")
 REQUEST_COUNTER = Counter("agentops_api_requests_total", "Total API requests")
 TASK_CREATED_COUNTER = Counter("agentops_tasks_created_total", "Total tasks created")
 celery_app = Celery("agentops_api", broker=REDIS_URL, backend=REDIS_URL)
@@ -115,6 +128,28 @@ class PolicyUpdateRequest(BaseModel):
     is_active: bool | None = None
 
 
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class ProjectCreateRequest(BaseModel):
+    name: str
+    description: str | None = None
+
+
+class UserCreateRequest(BaseModel):
+    email: str
+    password: str
+    role: str = "member"
+    is_active: bool = True
+
+
+class UserRoleUpdateRequest(BaseModel):
+    role: str
+    is_active: bool | None = None
+
+
 PAYLOAD_MODEL_BY_ADAPTER: dict[str, type[BaseModel]] = {
     "tasks.sample_echo_task": EchoPayload,
     "tasks.sample_http_check_task": HttpCheckPayload,
@@ -124,6 +159,194 @@ PAYLOAD_MODEL_BY_TEMPLATE_NAME: dict[str, type[BaseModel]] = {
     "sample_echo_task": EchoPayload,
     "sample_http_check_task": HttpCheckPayload,
 }
+
+
+def _ensure_auth_mode() -> str:
+    if AUTH_MODE not in {"disabled", "optional", "required"}:
+        return "optional"
+    return AUTH_MODE
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(data: str) -> bytes:
+    padding = "=" * ((4 - (len(data) % 4)) % 4)
+    return base64.urlsafe_b64decode((data + padding).encode("ascii"))
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        bytes.fromhex(salt),
+        AUTH_PASSWORD_ITERATIONS,
+    )
+    return f"pbkdf2_sha256${AUTH_PASSWORD_ITERATIONS}${salt}${_b64url_encode(digest)}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        algo, iterations_text, salt, digest_b64 = encoded.split("$", 3)
+        if algo != "pbkdf2_sha256":
+            return False
+        iterations = int(iterations_text)
+        expected = _b64url_decode(digest_b64)
+        current = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            bytes.fromhex(salt),
+            iterations,
+        )
+        return hmac.compare_digest(current, expected)
+    except Exception:
+        return False
+
+
+def create_access_token(*, user_id: UUID, email: str, role: str) -> tuple[str, int]:
+    now_ts = int(now_utc().timestamp())
+    exp_ts = now_ts + AUTH_TOKEN_TTL_SEC
+    header = {"alg": "HS256", "typ": "JWT"}
+    payload = {
+        "sub": str(user_id),
+        "email": email,
+        "role": role,
+        "iat": now_ts,
+        "exp": exp_ts,
+    }
+    encoded_header = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    encoded_payload = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signing_input = f"{encoded_header}.{encoded_payload}".encode("ascii")
+    signature = hmac.new(AUTH_JWT_SECRET.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    token = f"{encoded_header}.{encoded_payload}.{_b64url_encode(signature)}"
+    return token, exp_ts
+
+
+def decode_access_token(token: str) -> dict[str, Any]:
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise HTTPException(status_code=401, detail="Invalid token format")
+    header_b64, payload_b64, signature_b64 = parts
+    try:
+        signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+        expected = hmac.new(AUTH_JWT_SECRET.encode("utf-8"), signing_input, hashlib.sha256).digest()
+        provided = _b64url_decode(signature_b64)
+        if not hmac.compare_digest(expected, provided):
+            raise HTTPException(status_code=401, detail="Invalid token signature")
+        payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Invalid token payload") from exc
+
+    exp_ts = int(payload.get("exp", 0))
+    if exp_ts <= int(now_utc().timestamp()):
+        raise HTTPException(status_code=401, detail="Token expired")
+    return payload
+
+
+def extract_bearer_token(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    prefix = "Bearer "
+    if not authorization.startswith(prefix):
+        return None
+    token = authorization[len(prefix) :].strip()
+    return token or None
+
+
+def _load_user_by_id(conn: psycopg.Connection, user_id: UUID) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT id, email, role, is_active, created_at, updated_at
+        FROM users
+        WHERE id = %s
+        """,
+        (user_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "email": row[1],
+        "role": row[2],
+        "is_active": row[3],
+        "created_at": row[4],
+        "updated_at": row[5],
+    }
+
+
+def resolve_user_from_token(token: str) -> dict[str, Any]:
+    payload = decode_access_token(token)
+    user_id_raw = payload.get("sub")
+    if not user_id_raw:
+        raise HTTPException(status_code=401, detail="Token subject missing")
+    try:
+        user_id = UUID(str(user_id_raw))
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="Token subject invalid") from exc
+
+    with db_conn() as conn:
+        user = _load_user_by_id(conn, user_id)
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        if not user["is_active"]:
+            raise HTTPException(status_code=401, detail="Inactive user")
+        return user
+
+
+def current_user(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    request_user = getattr(request.state, "user", None)
+    if request_user:
+        return request_user
+    token = extract_bearer_token(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    user = resolve_user_from_token(token)
+    request.state.user = user
+    return user
+
+
+def require_role(*roles: str):
+    def dependency(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+        if user["role"] not in roles:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        return user
+
+    return dependency
+
+
+def normalize_role(role: str) -> str:
+    normalized = role.strip().lower()
+    if normalized not in {"admin", "member", "viewer"}:
+        raise HTTPException(status_code=422, detail=f"Unsupported role: {role}")
+    return normalized
+
+
+def append_audit_log(
+    conn: psycopg.Connection,
+    *,
+    actor_user_id: UUID | None,
+    project_id: UUID | None,
+    event_type: str,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO audit_logs (id, actor_user_id, project_id, event_type, payload_json, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+        (
+            uuid4(),
+            actor_user_id,
+            project_id,
+            event_type,
+            Jsonb(payload) if payload is not None else None,
+            now_utc(),
+        ),
+    )
 
 
 @contextmanager
@@ -142,6 +365,14 @@ def _template_seed_id(name: str) -> UUID:
 
 def _template_version_seed_id(name: str, version: str) -> UUID:
     return uuid5(NAMESPACE_DNS, f"agentops-template:{name}:{version}")
+
+
+def _project_seed_id(name: str) -> UUID:
+    return uuid5(NAMESPACE_DNS, f"agentops-project:{name}")
+
+
+def _user_seed_id(email: str) -> UUID:
+    return uuid5(NAMESPACE_DNS, f"agentops-user:{email.lower()}")
 
 
 def _seed_registry(conn: psycopg.Connection) -> None:
@@ -229,6 +460,50 @@ def _seed_registry(conn: psycopg.Connection) -> None:
             """,
             (item["version"], template_id),
         )
+
+
+def _seed_phase4_auth(conn: psycopg.Connection) -> None:
+    project_id = _project_seed_id(DEFAULT_PROJECT_NAME)
+    now = now_utc()
+    conn.execute(
+        """
+        INSERT INTO projects (id, name, description, created_at)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (name) DO NOTHING
+        """,
+        (project_id, DEFAULT_PROJECT_NAME, "Default project", now),
+    )
+    user_id = _user_seed_id(DEFAULT_ADMIN_EMAIL)
+    exists = conn.execute(
+        "SELECT id FROM users WHERE lower(email) = lower(%s)",
+        (DEFAULT_ADMIN_EMAIL,),
+    ).fetchone()
+    if not exists:
+        conn.execute(
+            """
+            INSERT INTO users (id, email, password_hash, role, is_active, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, TRUE, %s, %s)
+            """,
+            (
+                user_id,
+                DEFAULT_ADMIN_EMAIL,
+                hash_password(DEFAULT_ADMIN_PASSWORD),
+                "admin",
+                now,
+                now,
+            ),
+        )
+    else:
+        user_id = exists[0]
+
+    conn.execute(
+        """
+        INSERT INTO project_memberships (id, project_id, user_id, role, created_at)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (project_id, user_id) DO NOTHING
+        """,
+        (uuid4(), project_id, user_id, "admin", now),
+    )
 
 
 def initialize_schema() -> None:
@@ -383,6 +658,65 @@ def initialize_schema() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id UUID PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member',
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS projects (
+                id UUID PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT,
+                created_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS project_memberships (
+                id UUID PRIMARY KEY,
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                role TEXT NOT NULL DEFAULT 'member',
+                created_at TIMESTAMPTZ NOT NULL,
+                UNIQUE(project_id, user_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id UUID PRIMARY KEY,
+                actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                project_id UUID REFERENCES projects(id) ON DELETE SET NULL,
+                event_type TEXT NOT NULL,
+                payload_json JSONB,
+                created_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS backup_runs (
+                id UUID PRIMARY KEY,
+                started_at TIMESTAMPTZ NOT NULL,
+                finished_at TIMESTAMPTZ,
+                status TEXT NOT NULL,
+                artifact_path TEXT,
+                message TEXT
+            )
+            """
+        )
 
         conn.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS template_id UUID")
         conn.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS template_version TEXT")
@@ -451,8 +785,16 @@ def initialize_schema() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_policy_actions_rule_executed ON policy_actions(rule_id, executed_at DESC)"
         )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_role_active ON users(role, is_active)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_project_memberships_user ON project_memberships(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_logs_project_created_at ON audit_logs(project_id, created_at DESC)"
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_backup_runs_started_at ON backup_runs(started_at DESC)")
 
         _seed_registry(conn)
+        _seed_phase4_auth(conn)
 
         conn.execute(
             """
@@ -958,6 +1300,30 @@ def start_scheduler_thread_once() -> None:
     _SCHEDULER_THREAD_STARTED = True
 
 
+@app.middleware("http")
+async def v1_auth_middleware(request: Request, call_next):
+    path = request.url.path
+    mode = _ensure_auth_mode()
+    if mode == "disabled" or not path.startswith("/v1/"):
+        return await call_next(request)
+    if path in PUBLIC_V1_PATHS:
+        return await call_next(request)
+
+    token = extract_bearer_token(request.headers.get("authorization"))
+    if token:
+        try:
+            request.state.user = resolve_user_from_token(token)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    elif mode == "required":
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+    user = getattr(request.state, "user", None)
+    if user and user["role"] == "viewer" and request.method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+        return JSONResponse(status_code=403, content={"detail": "Viewer role is read-only"})
+    return await call_next(request)
+
+
 @app.on_event("startup")
 def startup_event() -> None:
     initialize_schema()
@@ -974,6 +1340,328 @@ def healthz() -> dict[str, str]:
 def readyz() -> dict[str, str]:
     REQUEST_COUNTER.inc()
     return {"status": "ready"}
+
+
+@app.post("/v1/auth/login")
+def auth_login(req: LoginRequest) -> dict[str, Any]:
+    REQUEST_COUNTER.inc()
+    with db_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, email, password_hash, role, is_active
+            FROM users
+            WHERE lower(email) = lower(%s)
+            """,
+            (req.email,),
+        ).fetchone()
+        if not row or not row[4] or not verify_password(req.password, row[2]):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        token, exp_ts = create_access_token(user_id=row[0], email=row[1], role=row[3])
+        append_audit_log(
+            conn,
+            actor_user_id=row[0],
+            project_id=None,
+            event_type="auth.login",
+            payload={"email": row[1]},
+        )
+        conn.commit()
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_at": datetime.fromtimestamp(exp_ts, tz=UTC).isoformat(),
+        "user": {"id": str(row[0]), "email": row[1], "role": row[3]},
+    }
+
+
+@app.post("/v1/auth/logout")
+def auth_logout(user: dict[str, Any] | None = Depends(current_user)) -> dict[str, str]:
+    REQUEST_COUNTER.inc()
+    with db_conn() as conn:
+        append_audit_log(
+            conn,
+            actor_user_id=user["id"] if user else None,
+            project_id=None,
+            event_type="auth.logout",
+            payload={"user_id": str(user["id"])} if user else None,
+        )
+        conn.commit()
+    return {"status": "ok"}
+
+
+@app.get("/v1/auth/me")
+def auth_me(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    REQUEST_COUNTER.inc()
+    with db_conn() as conn:
+        memberships = conn.execute(
+            """
+            SELECT p.id, p.name, pm.role
+            FROM project_memberships pm
+            JOIN projects p ON p.id = pm.project_id
+            WHERE pm.user_id = %s
+            ORDER BY p.name
+            """,
+            (user["id"],),
+        ).fetchall()
+    return {
+        "id": str(user["id"]),
+        "email": user["email"],
+        "role": user["role"],
+        "projects": [{"id": str(row[0]), "name": row[1], "role": row[2]} for row in memberships],
+    }
+
+
+@app.get("/v1/users")
+def list_users(_: dict[str, Any] = Depends(require_role("admin"))) -> list[dict[str, Any]]:
+    REQUEST_COUNTER.inc()
+    with db_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, email, role, is_active, created_at, updated_at
+            FROM users
+            ORDER BY created_at ASC
+            """
+        ).fetchall()
+    return [
+        {
+            "id": str(row[0]),
+            "email": row[1],
+            "role": row[2],
+            "is_active": row[3],
+            "created_at": row[4].isoformat(),
+            "updated_at": row[5].isoformat(),
+        }
+        for row in rows
+    ]
+
+
+@app.post("/v1/users", status_code=201)
+def create_user(req: UserCreateRequest, actor: dict[str, Any] = Depends(require_role("admin"))) -> dict[str, Any]:
+    REQUEST_COUNTER.inc()
+    role = normalize_role(req.role)
+    user_id = uuid4()
+    now = now_utc()
+    with db_conn() as conn:
+        dup = conn.execute("SELECT 1 FROM users WHERE lower(email) = lower(%s)", (req.email,)).fetchone()
+        if dup:
+            raise HTTPException(status_code=409, detail=f"User already exists: {req.email}")
+        conn.execute(
+            """
+            INSERT INTO users (id, email, password_hash, role, is_active, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (user_id, req.email, hash_password(req.password), role, req.is_active, now, now),
+        )
+        append_audit_log(
+            conn,
+            actor_user_id=actor["id"],
+            project_id=None,
+            event_type="user.create",
+            payload={"user_id": str(user_id), "email": req.email, "role": role, "is_active": req.is_active},
+        )
+        conn.commit()
+    return {"id": str(user_id), "email": req.email, "role": role, "is_active": req.is_active}
+
+
+@app.patch("/v1/users/{user_id}")
+def update_user_role(
+    user_id: UUID,
+    req: UserRoleUpdateRequest,
+    actor: dict[str, Any] = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    REQUEST_COUNTER.inc()
+    role = normalize_role(req.role)
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT email, role, is_active FROM users WHERE id = %s",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        next_active = req.is_active if req.is_active is not None else row[2]
+        conn.execute(
+            """
+            UPDATE users
+            SET role = %s, is_active = %s, updated_at = %s
+            WHERE id = %s
+            """,
+            (role, next_active, now_utc(), user_id),
+        )
+        append_audit_log(
+            conn,
+            actor_user_id=actor["id"],
+            project_id=None,
+            event_type="user.update",
+            payload={
+                "target_user_id": str(user_id),
+                "previous_role": row[1],
+                "new_role": role,
+                "previous_active": row[2],
+                "new_active": next_active,
+            },
+        )
+        conn.commit()
+    return {"id": str(user_id), "email": row[0], "role": role, "is_active": next_active}
+
+
+@app.get("/v1/projects")
+def list_projects(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
+    REQUEST_COUNTER.inc()
+    with db_conn() as conn:
+        if user["role"] == "admin":
+            rows = conn.execute(
+                """
+                SELECT id, name, description, created_at
+                FROM projects
+                ORDER BY name
+                """
+            ).fetchall()
+            return [
+                {
+                    "id": str(row[0]),
+                    "name": row[1],
+                    "description": row[2],
+                    "created_at": row[3].isoformat(),
+                }
+                for row in rows
+            ]
+
+        rows = conn.execute(
+            """
+            SELECT p.id, p.name, p.description, p.created_at, pm.role
+            FROM projects p
+            JOIN project_memberships pm ON pm.project_id = p.id
+            WHERE pm.user_id = %s
+            ORDER BY p.name
+            """,
+            (user["id"],),
+        ).fetchall()
+    return [
+        {
+            "id": str(row[0]),
+            "name": row[1],
+            "description": row[2],
+            "created_at": row[3].isoformat(),
+            "membership_role": row[4],
+        }
+        for row in rows
+    ]
+
+
+@app.post("/v1/projects", status_code=201)
+def create_project(req: ProjectCreateRequest, actor: dict[str, Any] = Depends(require_role("admin"))) -> dict[str, Any]:
+    REQUEST_COUNTER.inc()
+    project_id = uuid4()
+    now = now_utc()
+    with db_conn() as conn:
+        dup = conn.execute("SELECT 1 FROM projects WHERE name = %s", (req.name,)).fetchone()
+        if dup:
+            raise HTTPException(status_code=409, detail=f"Project already exists: {req.name}")
+        conn.execute(
+            """
+            INSERT INTO projects (id, name, description, created_at)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (project_id, req.name, req.description, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO project_memberships (id, project_id, user_id, role, created_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (project_id, user_id) DO NOTHING
+            """,
+            (uuid4(), project_id, actor["id"], "admin", now),
+        )
+        append_audit_log(
+            conn,
+            actor_user_id=actor["id"],
+            project_id=project_id,
+            event_type="project.create",
+            payload={"project_name": req.name},
+        )
+        conn.commit()
+    return {"id": str(project_id), "name": req.name, "description": req.description, "created_at": now.isoformat()}
+
+
+@app.get("/v1/audit/logs")
+def list_audit_logs(
+    project_id: UUID | None = None,
+    limit: int = 100,
+    user: dict[str, Any] = Depends(current_user),
+) -> list[dict[str, Any]]:
+    REQUEST_COUNTER.inc()
+    safe_limit = min(max(limit, 1), 500)
+    conditions = ["1=1"]
+    params: list[Any] = []
+    if project_id is not None:
+        conditions.append("al.project_id = %s")
+        params.append(project_id)
+    if user["role"] != "admin":
+        conditions.append(
+            """
+            (al.project_id IS NULL OR EXISTS (
+                SELECT 1
+                FROM project_memberships pm
+                WHERE pm.project_id = al.project_id
+                  AND pm.user_id = %s
+            ))
+            """
+        )
+        params.append(user["id"])
+
+    where_sql = " AND ".join(conditions)
+    with db_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT al.id, al.actor_user_id, u.email, al.project_id, p.name, al.event_type, al.payload_json, al.created_at
+            FROM audit_logs al
+            LEFT JOIN users u ON u.id = al.actor_user_id
+            LEFT JOIN projects p ON p.id = al.project_id
+            WHERE {where_sql}
+            ORDER BY al.created_at DESC
+            LIMIT %s
+            """,
+            tuple(params + [safe_limit]),
+        ).fetchall()
+    return [
+        {
+            "id": str(row[0]),
+            "actor_user_id": str(row[1]) if row[1] else None,
+            "actor_email": row[2],
+            "project_id": str(row[3]) if row[3] else None,
+            "project_name": row[4],
+            "event_type": row[5],
+            "payload": row[6],
+            "created_at": row[7].isoformat(),
+        }
+        for row in rows
+    ]
+
+
+@app.get("/v1/backups/runs")
+def list_backup_runs(limit: int = 50, _: dict[str, Any] = Depends(require_role("admin", "member", "viewer"))) -> list[dict[str, Any]]:
+    REQUEST_COUNTER.inc()
+    safe_limit = min(max(limit, 1), 200)
+    with db_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, started_at, finished_at, status, artifact_path, message
+            FROM backup_runs
+            ORDER BY started_at DESC
+            LIMIT %s
+            """,
+            (safe_limit,),
+        ).fetchall()
+    return [
+        {
+            "id": str(row[0]),
+            "started_at": row[1].isoformat(),
+            "finished_at": row[2].isoformat() if row[2] else None,
+            "status": row[3],
+            "artifact_path": row[4],
+            "message": row[5],
+        }
+        for row in rows
+    ]
 
 
 @app.get("/v1/templates")
