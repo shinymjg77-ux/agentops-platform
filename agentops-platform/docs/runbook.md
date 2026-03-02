@@ -27,6 +27,7 @@
   - `make test-e2e`
   - `make test-e2e-phase2`
   - `make test-e2e-phase3`
+  - `make test-e2e-phase4`
 - 멀티워커(선택) 기동:
   - `docker compose -f infra/compose/docker-compose.yml --profile multiworker up -d --build worker-2`
 
@@ -44,6 +45,7 @@
    - `make test-e2e`
    - `make test-e2e-phase2`
    - `make test-e2e-phase3`
+   - `make test-e2e-phase4`
 
 ## 5) 장애 대응
 ### A. API/대시보드 응답 없음
@@ -78,6 +80,9 @@
 - Docker context는 `docker-desktop`으로 고정한다.
 - 알림 웹훅은 선택 기능이다. 사용 시 `.env`에 `ALERT_WEBHOOK_URL`을 설정하고 `worker`를 재기동한다.
 - 기본 테스트 경로는 `alert-sink` 서비스(`http://alert-sink:8080/events`)를 사용한다.
+- 인증 모드:
+  - `AUTH_MODE=optional`(기본): 기존 API 호환 + 인증 API 사용 가능
+  - `AUTH_MODE=required`: 로그인 제외 `/v1/*` 토큰 필수
 - 민감정보(토큰/비밀번호/개인키)는 로그/문서에 기록하지 않는다.
 
 ## 7) 복구 기준
@@ -85,4 +90,4 @@
   - API `healthz/readyz` 정상
   - Dashboard 접속 가능
   - `make test-e2e` 통과
-  - (Phase3 환경) `make test-e2e-phase2`, `make test-e2e-phase3` 통과
+  - (Phase4 기준) `make test-e2e-phase2`, `make test-e2e-phase3`, `make test-e2e-phase4` 통과

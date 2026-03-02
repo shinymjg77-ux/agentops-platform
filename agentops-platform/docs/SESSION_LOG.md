@@ -400,3 +400,35 @@
 
 ### 다음
 - 원격 저장소 커밋/푸시 단위 정리
+
+## 2026-03-02 10:20 KST - Phase4 코드/문서 정리 및 검증
+
+### 작업 내용
+- 점검:
+  - 실행 컨테이너가 구버전 API를 바라봐 `/v1/auth/*`가 404였던 상태를 확인
+  - `make up` 재빌드 후 Phase4 인증 엔드포인트 반영 확인
+- 코드 정리:
+  - `.gitignore`에 `.omx/` 추가(로컬 CLI 상태 파일 제외)
+- 문서 정리:
+  - `README.md` Phase4 문서/상태 최신화
+  - `docs/runbook.md`에 Phase4 E2E 및 인증 모드 정책 반영
+  - `docs/Phase4_Plan_ko.md` 체크리스트 진행 상태 반영
+  - Phase4 누락 문서 3종 추가:
+    - `docs/phase4-data-model-ko.md`
+    - `docs/phase4-ui-spec-ko.md`
+    - `docs/phase4-test-plan-ko.md`
+
+### 검증
+- `make test-e2e` 통과
+- `make test-e2e-phase2` 통과
+- `make test-e2e-phase3` 통과
+- `make test-e2e-phase4` 통과
+
+### 완료/오류
+- 완료:
+  - Phase4 1차 구현 기준으로 코드/문서/테스트 정리 완료
+- 오류:
+  - 없음(재빌드 전 404 이슈는 해소)
+
+### 다음
+- 정리된 변경분 커밋/푸시

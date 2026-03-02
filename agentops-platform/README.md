@@ -38,6 +38,7 @@ E2E 테스트 실행:
 make test-e2e
 make test-e2e-phase2
 make test-e2e-phase3
+make test-e2e-phase4
 ```
 
 멀티워커(선택) 실행:
@@ -108,6 +109,13 @@ curl -sS -X POST http://localhost:8000/v1/tasks/<TASK_ID>/retry
 - `.env`에 `ALERT_WEBHOOK_URL` 설정 시 워커가 실패/재시도 이벤트를 POST 전송
 - 기본값은 테스트용 `alert-sink`(`http://alert-sink:8080/events`)로 설정됨
 
+Phase4 인증(점진 적용):
+- 기본값: `AUTH_MODE=optional` (기존 API 흐름 유지 + 인증 API 사용 가능)
+- 강제 모드: `AUTH_MODE=required` (로그인 제외 `/v1/*` 인증 필요)
+- 기본 관리자 계정:
+  - `DEFAULT_ADMIN_EMAIL` (기본 `admin@agentops.local`)
+  - `DEFAULT_ADMIN_PASSWORD` (기본 `change-me-now`)
+
 ## 작업 회고 로그
 
 - 경로: `docs/WORK_LOG.md`
@@ -147,6 +155,10 @@ scripts/add_work_log.sh "제목"
 
 - PRD: `docs/PRD_AgentOps_v3_ko.md`
 - 계획: `docs/Phase4_Plan_ko.md`
+- 데이터 모델: `docs/phase4-data-model-ko.md`
+- API 스펙: `docs/phase4-api-spec-ko.md`
+- UI 스펙: `docs/phase4-ui-spec-ko.md`
+- 테스트 계획: `docs/phase4-test-plan-ko.md`
 
 ## Phase 1 문서 세트(상세)
 
@@ -169,3 +181,4 @@ scripts/add_work_log.sh "제목"
 - 10단계: webhook 수신 검증(alert-sink)까지 포함한 Phase1 체크리스트 완료
 - 11단계: Phase2(템플릿 레지스트리/버전 비교/고급 검색) 구현 및 E2E 완료
 - 12단계: Phase3(스케줄/정책/에이전트/멀티워커) 구현 및 E2E 완료
+- 13단계: Phase4 1차(Auth/RBAC/프로젝트/감사로그/백업이력 API) 및 E2E 완료
