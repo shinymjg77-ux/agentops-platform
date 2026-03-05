@@ -1,0 +1,33 @@
+name: creator-dm-autopost-weekly-slo
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+jobs:
+  slo-report:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: creator-dm-autopost
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r api/requirements.txt
+
+      - name: Generate report
+        run: python scripts/generate_slo_report.py
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-slo-report
+          path: creator-dm-autopost/docs/reports/*.md
